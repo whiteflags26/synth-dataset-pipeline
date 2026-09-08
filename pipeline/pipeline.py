@@ -1,10 +1,12 @@
 """
 Pipeline Orchestrator — end-to-end flow:
 
-  CSV  →  Report Parser  →  Structured Prompt (Gemini/GPT)  →  Image Prompt  →  DALL-E / Gemini
+  CSV  →  Report Parser  →  Structured Prompt (GPT/Gemini)  →  Image Prompt
+       →  DALL-E / Gemini / Stable Diffusion 3
                          ↑
               Optional: indiana_projections.csv + images_dir
-              → reference images passed as multimodal input
+              → reference images passed as multimodal input (Gemini)
+                or as the img2img init image (SD3)
 """
 
 from __future__ import annotations
@@ -25,6 +27,56 @@ from .image_generator import compute_best_aspect_ratio, generate_image
 from .view_splitter import split_prompt_by_views
 
 
+def _apply_output_subdir(name: str) -> None:
+    """
+    Redirect output into a named subdirectory.
+
+    Lets several runs of the same uids coexist — txt2img beside img2img, or a
+    parameter sweep — instead of overwriting each other, since the filename
+    contract is <uid>.png regardless of backend or settings.
+    """
+    config.IMAGES_DIR = config.OUTPUT_DIR / "images" / name
+    config.METADATA_FILE = config.OUTPUT_DIR / f"metadata_{name}.json"
+    config.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _sd3_params(
+    sd3_mode: str | None,
+    ref_image_paths: list[Path] | None,
+    source_dimensions: tuple[int, int] | None,
+) -> dict:
+    """
+    Record the SD3 settings that actually produced an image.
+
+    The mode stored here is the *effective* one after any img2img → txt2img
+    downgrade, so metadata reflects what ran rather than what was requested.
+    Without this a mixed run is indistinguishable from a pure one afterwards.
+    """
+    from .sd3_generator import _resolve_mode, compute_sd3_dimensions
+
+    effective = _resolve_mode(sd3_mode, ref_image_paths)
+    width, height = (
+        compute_sd3_dimensions(*source_dimensions)
+        if source_dimensions
+        else (config.SD3_WIDTH, config.SD3_HEIGHT)
+    )
+
+    params: dict = {
+        "mode": effective,
+        "model_id": config.SD3_MODEL_ID,
+        "steps": config.SD3_STEPS,
+        "guidance_scale": config.SD3_GUIDANCE_SCALE,
+        "seed": config.SD3_SEED,
+        "width": width,
+        "height": height,
+    }
+    if effective == "img2img" and ref_image_paths:
+        params["strength"] = config.SD3_IMG2IMG_STRENGTH
+        params["init_image"] = ref_image_paths[0].name
+
+    return params
+
+
 def run_pipeline(
     csv_path: str | Path,
     limit: int | None = None,
@@ -33,6 +85,8 @@ def run_pipeline(
     skip_image_generation: bool = False,
     projections_csv: str | Path | None = None,
     images_dir: str | Path | None = None,
+    sd3_mode: str | None = None,
+    output_subdir: str | None = None,
 ) -> list[dict]:
     """
     Execute the full pipeline.
@@ -42,7 +96,7 @@ def run_pipeline(
     csv_path              : path to indiana_reports.csv
     limit                 : process only the first N reports (after offset)
     offset                : skip the first N reports
-    generator             : "dalle" or "gemini" (overrides config)
+    generator             : "dalle", "gemini", or "sd3" (overrides config)
     skip_image_generation : if True, stop after prompt generation (useful for testing)
     projections_csv       : optional path to indiana_projections.csv.
                             Required when images_dir is provided.
@@ -51,6 +105,10 @@ def run_pipeline(
                             /kaggle/input/.../images_normalized/).
                             When provided along with projections_csv,
                             reference images are passed as multimodal input.
+    sd3_mode              : "txt2img" or "img2img" (SD3 generator only)
+    output_subdir         : write images to output/images/<name>/ and metadata
+                            to output/metadata_<name>.json instead of the
+                            defaults, so parallel runs do not overwrite.
 
     Returns
     -------
@@ -58,6 +116,18 @@ def run_pipeline(
     """
     gen = generator or config.IMAGE_GENERATOR
     images_dir_path = Path(images_dir) if images_dir else None
+
+    if output_subdir:
+        _apply_output_subdir(output_subdir)
+
+    # ── SD3 configuration checks ─────────────────────────────────────────
+    effective_sd3_mode = (sd3_mode or config.SD3_MODE).lower() if gen == "sd3" else None
+    if effective_sd3_mode == "img2img" and not images_dir_path:
+        print(
+            "⚠  SD3_MODE=img2img but no --images-dir was given — every record "
+            "will fall back to txt2img. Pass --images-dir and --projections-csv "
+            "to condition on the real X-rays.\n"
+        )
 
     # ── Load projections lookup (optional) ───────────────────────────────
     projections = None
@@ -77,6 +147,19 @@ def run_pipeline(
     print(f"🤖 Initializing LLM chain (model: {config.CHAT_MODEL}) ...")
     chain = build_prompt_chain()
     print("   → Chain ready\n")
+
+    # ── Preload SD3 before the loop ──────────────────────────────────────
+    # SD3 is a multi-gigabyte local model, not an HTTP client. Loading it here
+    # keeps the 30-90s cost off the first record and makes the tqdm ETA honest.
+    # In img2img mode both cache entries are warmed so a mid-run downgrade to
+    # txt2img never stalls on a cold load.
+    if gen == "sd3" and not skip_image_generation:
+        from .sd3_generator import load_sd3_pipeline
+
+        load_sd3_pipeline("txt2img")
+        if effective_sd3_mode == "img2img":
+            load_sd3_pipeline("img2img")
+        print()
 
     results: list[dict] = []
 
@@ -174,8 +257,14 @@ def run_pipeline(
                         image_paths=ref_image_paths,
                         view_suffix=view_name,
                         source_dimensions=source_dimensions,
+                        structured_prompt=view_prompt,
+                        sd3_mode=sd3_mode,
                     )
                     view_entry["image_path"] = str(image_path)
+                    if gen == "sd3":
+                        view_entry["sd3_params"] = _sd3_params(
+                            sd3_mode, ref_image_paths, source_dimensions
+                        )
                     tqdm.write(
                         f"  ✓ uid={record.uid} [{view_name or 'single'}] → {image_path.name}"
                     )
@@ -193,10 +282,154 @@ def run_pipeline(
 
             views_data.append(view_entry)
 
+        entry["generator"] = gen
         entry["views"] = views_data
         results.append(entry)
 
     # ── Save metadata ────────────────────────────────────────────────────
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(config.METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n📄 Metadata saved to {config.METADATA_FILE}")
+    print(f"🖼  Images saved to {config.IMAGES_DIR}")
+
+    return results
+
+
+_DEFAULT_CSV = str(config.PROJECT_ROOT / "indiana_reports.csv")
+
+
+def run_from_prompts(
+    prompts_path: str | Path,
+    generator: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+    images_dir: str | Path | None = None,
+    sd3_mode: str | None = None,
+    output_subdir: str | None = None,
+) -> list[dict]:
+    """
+    Generate images from prompts already extracted into a metadata JSON file.
+
+    Skips the CSV load and the LLM entirely, so this needs no OpenAI or Google
+    credentials. The intended split is a cheap CPU run that extracts prompts
+    (--skip-images) followed by a GPU run that only diffuses — on Kaggle that
+    keeps LLM latency off the metered GPU session.
+
+    Parameters
+    ----------
+    prompts_path  : a metadata.json written by a previous run
+    images_dir    : needed only for SD3 img2img / Gemini reference images;
+                    filenames come from the metadata's reference_images
+    output_subdir : write elsewhere so the source file is not overwritten
+
+    Returns
+    -------
+    list of metadata dicts, in the same shape as run_pipeline's
+    """
+    gen = generator or config.IMAGE_GENERATOR
+    images_dir_path = Path(images_dir) if images_dir else None
+
+    if output_subdir:
+        _apply_output_subdir(output_subdir)
+    elif Path(prompts_path).resolve() == config.METADATA_FILE.resolve():
+        # Never clobber the file being read halfway through a long run.
+        _apply_output_subdir("regenerated")
+        print(
+            "⚠  --prompts-from points at the default metadata file; writing to "
+            f"{config.METADATA_FILE} instead to avoid overwriting it.\n"
+        )
+
+    print(f"📂 Loading prompts from {prompts_path} ...")
+    with open(prompts_path, encoding="utf-8") as f:
+        source_entries = json.load(f)
+
+    entries = [e for e in source_entries if e.get("views")]
+    if offset:
+        entries = entries[offset:]
+    if limit:
+        entries = entries[:limit]
+    print(f"   → {len(entries)} report(s) with prompts\n")
+
+    effective_sd3_mode = (sd3_mode or config.SD3_MODE).lower() if gen == "sd3" else None
+    if effective_sd3_mode == "img2img" and not images_dir_path:
+        print(
+            "⚠  SD3_MODE=img2img but no --images-dir was given — every record "
+            "will fall back to txt2img.\n"
+        )
+
+    if gen == "sd3":
+        from .sd3_generator import load_sd3_pipeline
+
+        load_sd3_pipeline("txt2img")
+        if effective_sd3_mode == "img2img":
+            load_sd3_pipeline("img2img")
+        print()
+
+    results: list[dict] = []
+
+    for source in tqdm(entries, desc="Generating images", unit="report"):
+        uid = source["uid"]
+        entry: dict = {"uid": uid, "generator": gen}
+
+        # Reference images and geometry are replayed from the metadata rather
+        # than re-derived, so a run matches the one that produced the prompts.
+        ref_image_paths: list[Path] | None = None
+        if images_dir_path and source.get("reference_images"):
+            resolved = [
+                images_dir_path / ref["filename"]
+                for ref in source["reference_images"]
+                if (images_dir_path / ref["filename"]).exists()
+            ]
+            if resolved:
+                ref_image_paths = resolved
+            entry["reference_images"] = source["reference_images"]
+
+        source_dimensions: tuple[int, int] | None = None
+        if source.get("source_dimensions"):
+            dims = source["source_dimensions"]
+            source_dimensions = (dims["width"], dims["height"])
+            entry["source_dimensions"] = dims
+
+        views_data: list[dict] = []
+        for source_view in source["views"]:
+            image_prompt = source_view.get("image_prompt")
+            if not image_prompt:
+                continue
+
+            view_name = source_view.get("view")
+            view_entry: dict = {"view": view_name, "image_prompt": image_prompt}
+
+            try:
+                image_path = generate_image(
+                    image_prompt,
+                    uid,
+                    generator=gen,
+                    image_paths=ref_image_paths,
+                    view_suffix=view_name,
+                    source_dimensions=source_dimensions,
+                    sd3_mode=sd3_mode,
+                )
+                view_entry["image_path"] = str(image_path)
+                if gen == "sd3":
+                    view_entry["sd3_params"] = _sd3_params(
+                        sd3_mode, ref_image_paths, source_dimensions
+                    )
+                tqdm.write(
+                    f"  ✓ uid={uid} [{view_name or 'single'}] → {image_path.name}"
+                )
+            except Exception as e:
+                print(
+                    f"\n  ✗ Image generation failed for uid={uid}"
+                    f" [{view_name or 'single'}]: {e}"
+                )
+                view_entry["error_image"] = str(e)
+
+            views_data.append(view_entry)
+
+        entry["views"] = views_data
+        results.append(entry)
+
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     with open(config.METADATA_FILE, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -213,7 +446,7 @@ def main():
     parser.add_argument(
         "--csv",
         type=str,
-        default=str(config.PROJECT_ROOT / "indiana_reports.csv"),
+        default=_DEFAULT_CSV,
         help="Path to the Indiana reports CSV file",
     )
     parser.add_argument(
@@ -250,17 +483,113 @@ def main():
     parser.add_argument(
         "--generator",
         type=str,
-        choices=["dalle", "gemini"],
+        choices=["dalle", "gemini", "sd3"],
         default=None,
         help="Image generator backend (overrides .env config)",
+    )
+    parser.add_argument(
+        "--sd3-mode",
+        type=str,
+        choices=["txt2img", "img2img"],
+        default=None,
+        help=(
+            "SD3 generation mode. txt2img ignores reference images and produces "
+            "purely synthetic output; img2img conditions on the real X-ray "
+            "(requires --images-dir). Overrides SD3_MODE in .env."
+        ),
+    )
+    parser.add_argument(
+        "--sd3-strength",
+        type=float,
+        default=None,
+        help=(
+            "SD3 img2img denoising strength, 0.0-1.0. Lower keeps more of the "
+            "reference X-ray; below ~0.4 the output is barely synthetic. "
+            "Default 0.75. Ignored in txt2img mode."
+        ),
+    )
+    parser.add_argument(
+        "--sd3-steps",
+        type=int,
+        default=None,
+        help="SD3 inference steps (default 28)",
+    )
+    parser.add_argument(
+        "--sd3-guidance",
+        type=float,
+        default=None,
+        help="SD3 guidance scale / CFG (default 7.0)",
+    )
+    parser.add_argument(
+        "--sd3-seed",
+        type=int,
+        default=None,
+        help="SD3 base seed; each uid is offset from it so runs are reproducible",
+    )
+    parser.add_argument(
+        "--sd3-model-id",
+        type=str,
+        default=None,
+        help="HuggingFace model id for SD3 (default stabilityai/stable-diffusion-3-medium-diffusers)",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        type=str,
+        default=None,
+        help=(
+            "Write images to output/images/<NAME>/ and metadata to "
+            "output/metadata_<NAME>.json, so runs do not overwrite each other."
+        ),
     )
     parser.add_argument(
         "--skip-images",
         action="store_true",
         help="Only generate prompts, skip image generation (for testing)",
     )
+    parser.add_argument(
+        "--prompts-from",
+        type=str,
+        default=None,
+        help=(
+            "Generate images from an existing metadata.json instead of reading "
+            "the CSV and calling the LLM. Needs no LLM credentials, so prompt "
+            "extraction can run on CPU and only generation on the GPU. "
+            "Mutually exclusive with --csv."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # CLI overrides config, following the value = arg or config.DEFAULT pattern.
+    if args.sd3_steps is not None:
+        config.SD3_STEPS = args.sd3_steps
+    if args.sd3_guidance is not None:
+        config.SD3_GUIDANCE_SCALE = args.sd3_guidance
+    if args.sd3_seed is not None:
+        config.SD3_SEED = args.sd3_seed
+    if args.sd3_model_id is not None:
+        config.SD3_MODEL_ID = args.sd3_model_id
+    if args.sd3_strength is not None:
+        effective_mode = (args.sd3_mode or config.SD3_MODE).lower()
+        if effective_mode == "txt2img":
+            print("⚠  --sd3-strength has no effect in txt2img mode; ignoring.\n")
+        config.SD3_IMG2IMG_STRENGTH = args.sd3_strength
+
+    if args.prompts_from:
+        if args.csv != _DEFAULT_CSV:
+            print("⚠  --csv is ignored when --prompts-from is given.\n")
+        if args.skip_images:
+            parser.error("--skip-images makes --prompts-from a no-op.")
+        run_from_prompts(
+            prompts_path=args.prompts_from,
+            generator=args.generator,
+            limit=args.limit,
+            offset=args.offset,
+            images_dir=args.images_dir,
+            sd3_mode=args.sd3_mode,
+            output_subdir=args.output_subdir,
+        )
+        return
 
     run_pipeline(
         csv_path=args.csv,
@@ -270,6 +599,8 @@ def main():
         skip_image_generation=args.skip_images,
         projections_csv=args.projections_csv,
         images_dir=args.images_dir,
+        sd3_mode=args.sd3_mode,
+        output_subdir=args.output_subdir,
     )
 
 

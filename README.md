@@ -18,6 +18,7 @@ A modular, end-to-end pipeline for generating clinically conditioned synthetic c
   - [Basic Execution](#basic-execution)
   - [Advanced Options](#advanced-options)
   - [Kaggle Environment](#kaggle-environment)
+- [Stable Diffusion 3 (local GPU)](#stable-diffusion-3-local-gpu)
 - [Data Requirements](#data-requirements)
 - [Module Reference](#module-reference)
   - [Report Parser](#report-parser)
@@ -25,6 +26,8 @@ A modular, end-to-end pipeline for generating clinically conditioned synthetic c
   - [View Splitter](#view-splitter)
   - [Image Prompt Formatter](#image-prompt-formatter)
   - [Image Generator](#image-generator)
+  - [SD3 Prompt Adapter](#sd3-prompt-adapter)
+  - [SD3 Generator](#sd3-generator)
   - [Pipeline Orchestrator](#pipeline-orchestrator)
 - [Output Format](#output-format)
 - [Aspect Ratio Preservation](#aspect-ratio-preservation)
@@ -240,6 +243,17 @@ Both backends implement retry logic with exponential backoff (up to 3 attempts p
    pip install -r requirements.txt
    ```
 
+   For the Stable Diffusion 3 back-end, also install the GPU stack. It is kept
+   in a separate file so a CPU-only clone does not pull a multi-gigabyte torch
+   wheel:
+
+   ```bash
+   pip install -r requirements-sd3.txt
+   ```
+
+   On Kaggle and Colab, torch is preinstalled — install everything *except*
+   torch there, since reinstalling it frequently breaks the CUDA build.
+
 4. **Configure environment variables:**
 
    ```bash
@@ -373,6 +387,118 @@ A companion notebook (`synth-dataset-notebook.ipynb`) is provided for Kaggle exe
 
 ---
 
+## Stable Diffusion 3 (local GPU)
+
+SD3 runs locally rather than behind an API, so it needs a GPU, a HuggingFace
+token, and a one-time model download of roughly 15 GB.
+
+### Setup
+
+1. Accept the license at
+   [huggingface.co/stabilityai/stable-diffusion-3-medium](https://huggingface.co/stabilityai/stable-diffusion-3-medium)
+   — the repo is gated, and downloads 401 without this.
+2. Create a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+   and set `HUGGINGFACE_TOKEN` in `.env`.
+3. `pip install -r requirements-sd3.txt`
+
+### Which mode do I want?
+
+| | `txt2img` (default) | `img2img` |
+|---|---|---|
+| Reference X-ray | ignored, warned once | used as the initial latent |
+| Output | purely synthetic — no pixel provenance from any real image | conditioned on the patient's real X-ray |
+| Geometry | explicit width/height from the bucket table | inherited from the resized reference |
+| Anatomical fidelity | generic | follows the actual patient's body habitus |
+| Speed | full step count | `strength × steps`, so ~25% faster at 0.75 |
+| Pick it for | real-vs-synthetic detector test sets, unconditional generation | anatomy fidelity to a specific patient |
+
+If the images are the "synthetic" half of a detector benchmark, prefer
+`txt2img`: img2img output derives from real pixels, so the detector may learn
+the residue of the real source rather than the generator's fingerprint.
+
+### Running
+
+```bash
+# Text-to-image — no reference images needed
+python -m pipeline --generator sd3 --sd3-mode txt2img \
+  --csv indiana_reports.csv --limit 5 --output-subdir txt2img
+
+# Image-to-image — conditions on the real X-rays
+python -m pipeline --generator sd3 --sd3-mode img2img --sd3-strength 0.75 \
+  --csv indiana_reports.csv \
+  --projections-csv indiana_projections.csv \
+  --images-dir /path/to/images_normalized \
+  --limit 5 --output-subdir img2img
+```
+
+`--output-subdir` writes to `output/images/<NAME>/` and
+`output/metadata_<NAME>.json`. Since the filename contract is `<uid>.png`
+regardless of settings, two runs over the same uids would otherwise overwrite
+each other — use it whenever comparing modes or sweeping parameters.
+
+### Two-session workflow (optional)
+
+SD3 generation is the expensive part; prompt extraction is not. `--prompts-from`
+replays prompts from an existing metadata file, skipping the CSV load and the
+LLM entirely — so it needs no OpenAI credentials at all:
+
+```bash
+# Session 1: CPU, needs only OPENAI_API_KEY
+python -m pipeline --limit 200 --skip-images
+
+# Session 2: GPU, no LLM credentials needed
+python -m pipeline --prompts-from output/metadata.json \
+  --generator sd3 --sd3-mode img2img \
+  --images-dir /path/to/images_normalized \
+  --output-subdir sd3_run
+```
+
+Reference images and source dimensions are replayed from the metadata rather
+than re-derived, so the geometry matches the run that produced the prompts. On
+Kaggle this keeps LLM latency off the metered GPU session; it also makes
+re-generating with different SD3 settings free of further LLM cost.
+
+### Tuning
+
+- **`--sd3-strength`** (img2img only, default `0.75`). `0.0` returns the input
+  untouched; `1.0` ignores it entirely. The useful band is ~0.5–0.8. Below
+  ~0.4 the output is a lightly filtered copy of a real X-ray — neither
+  synthetic nor safe to redistribute as one.
+- **`--sd3-steps`** (default `28`) and **`--sd3-guidance`** (default `7.0`) are
+  Stability AI's recommended settings for SD3 Medium.
+- **`--sd3-seed`** makes a run reproducible. Each uid is offset from the base
+  seed, so records still differ from one another, and a txt2img/img2img pair at
+  the same seed is directly comparable.
+
+### VRAM
+
+SD3 Medium needs ~16–18 GB at fp16 for the full pipeline.
+
+| GPU | Settings | Throughput |
+|---|---|---|
+| L4 / A100 / 4090 (24 GB+) | `SD3_DTYPE=bfloat16`, offload off | ~8–15 s/image |
+| T4 / P100 (16 GB) | `SD3_DTYPE=float16`, `SD3_ENABLE_CPU_OFFLOAD=true` | ~60–120 s/image |
+
+`bfloat16` needs compute capability 8.0+; on a T4 it produces black images, so
+the loader detects this and falls back to `float16` with a warning.
+`SD3_DROP_T5=true` frees ~10 GB as a last resort, but leaves only the 77-token
+CLIP encoders and so discards the long clinical prompt.
+
+### Prompt handling
+
+SD3 encodes text with three encoders: CLIP-L and CLIP-G both truncate at **77
+tokens**, while T5-XXL takes up to 512. The formatted radiology prompt is
+400–500 tokens, so passing it directly would mean CLIP sees only the leading
+boilerplate and never the clinical findings.
+
+`pipeline/sd3_prompt_adapter.py` splits it: a ≤60-word visual summary built
+from the structured fields goes to `prompt`/`prompt_2` (CLIP), the full
+structured text goes to `prompt_3` (T5), and the negative constraints move out
+of the positive prompt into `negative_prompt` — stating a prohibition inside a
+positive diffusion prompt reliably summons the thing it forbids.
+
+---
+
 ## Data Requirements
 
 ### Indiana Chest X-ray Reports (`indiana_reports.csv`)
@@ -441,13 +567,29 @@ Maps report UIDs to individual image files and their projection types:
 - `compute_best_aspect_ratio(width, height)` -- Finds the closest supported API aspect ratio for given pixel dimensions.
 - `generate_image_dalle(prompt, uid, ...)` -- Generates images using OpenAI DALL-E 3 with configurable size and quality.
 - `generate_image_gemini(prompt, uid, image_paths, ...)` -- Generates images using Google Gemini with optional multimodal reference image input and native aspect ratio control.
-- `generate_image(prompt, uid, generator, ...)` -- Dispatcher that routes to the appropriate backend.
+- `generate_image(prompt, uid, generator, ...)` -- Dispatcher that routes to the appropriate backend (`dalle`, `gemini`, or `sd3`).
+
+### SD3 Prompt Adapter
+
+**File:** `pipeline/sd3_prompt_adapter.py`
+
+- `split_prompt_for_sd3(prompt_text, sp)` -- Splits the long formatted prompt into `(clip_prompt, t5_prompt)` for SD3's three text encoders. The CLIP prompt is built from the structured fields and capped at 60 words; the T5 prompt is the full text minus the reference-image and negative-constraint sections. Falls back to mining `prompt_text` when no structured prompt is available.
+- `build_negative_prompt(extra)` -- Restates the negative constraints as comma-separated noun phrases for SD3's `negative_prompt` channel, optionally appending `SD3_NEGATIVE_PROMPT`.
+
+### SD3 Generator
+
+**File:** `pipeline/sd3_generator.py`
+
+- `load_sd3_pipeline(mode)` -- Loads and caches the SD3 diffusers pipeline per mode. The img2img class is bound with `from_pipe`, so both modes share one set of weights and one download. Handles dtype resolution (with a bf16-on-T4 guard), device selection, CPU offload, and VAE slicing.
+- `compute_sd3_dimensions(width, height)` -- Maps source dimensions to the nearest ~1MP bucket in `SD3_SUPPORTED_DIMENSIONS`.
+- `generate_image_sd3(prompt, uid, ...)` -- Generates an image in `txt2img` or `img2img` mode, with per-uid seeding, OOM-aware retries, and effective-mode reporting.
 
 ### Pipeline Orchestrator
 
 **File:** `pipeline/pipeline.py`
 
-- `run_pipeline(csv_path, limit, offset, generator, ...)` -- Executes the complete end-to-end pipeline: report loading, LLM extraction, view splitting, prompt formatting, image generation, and metadata persistence.
+- `run_pipeline(csv_path, limit, offset, generator, sd3_mode, output_subdir, ...)` -- Executes the complete end-to-end pipeline: report loading, LLM extraction, view splitting, prompt formatting, image generation, and metadata persistence. Preloads the SD3 pipeline before the record loop when `generator="sd3"`.
+- `run_from_prompts(prompts_path, generator, images_dir, ...)` -- Generates images from an existing metadata JSON, skipping the CSV load and the LLM. Requires no LLM credentials; replays reference images and source dimensions from the file.
 - `main()` -- CLI entry point with argument parsing.
 
 ---
@@ -559,6 +701,27 @@ python test_aspect_ratio.py
 ```
 
 Validates the `compute_best_aspect_ratio` function against known dimension-to-ratio mappings.
+
+### SD3 Checks
+
+```bash
+python test_sd3.py
+```
+
+Runs without a GPU, without torch or diffusers installed, and without
+downloading a model. Covers:
+
+- `compute_sd3_dimensions` bucket selection, and that every bucket has sides
+  divisible by 16
+- Prompt splitting: the CLIP prompt stays within budget and carries the actual
+  clinical findings rather than boilerplate; the T5 prompt keeps its content
+  sections and drops the negative constraints
+- That `sd3_generator` imports with `torch` and `diffusers` absent from
+  `sys.modules` — the deferred-import rule the whole package depends on
+- Mode resolution, including the img2img → txt2img downgrade when a record has
+  no reference image
+- Init-image loading: greyscale to RGB, resized to the target bucket
+- Dispatcher routing for `--generator sd3`
 
 ---
 

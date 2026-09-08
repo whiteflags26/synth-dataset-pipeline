@@ -1,3 +1,5 @@
+# Core pipeline. For the Stable Diffusion 3 back-end (--generator sd3),
+# also install: pip install -r requirements-sd3.txt
 langchain>=0.3.0
 langchain-openai>=0.3.0
 langchain-google-genai>=2.0.0

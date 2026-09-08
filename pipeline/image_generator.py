@@ -1,6 +1,7 @@
 """
-Image Generator — generates synthetic radiology images using DALL-E 3 or
-Google Vertex AI Gemini, driven by the formatted text prompt.
+Image Generator — generates synthetic radiology images using DALL-E 3,
+Google Vertex AI Gemini, or a local Stable Diffusion 3 model, driven by the
+formatted text prompt.
 Supports optional reference images as multimodal input for Gemini.
 Supports source_dimensions to preserve the original image aspect ratio
 natively (no post-processing resize) by passing the closest supported
@@ -257,6 +258,8 @@ def generate_image(
     image_paths: list[Path] | None = None,
     view_suffix: str | None = None,
     source_dimensions: tuple[int, int] | None = None,
+    structured_prompt=None,
+    sd3_mode: str | None = None,
 ) -> Path:
     """
     Generate an image using the configured (or specified) backend.
@@ -265,11 +268,16 @@ def generate_image(
     ----------
     prompt            : the formatted image generation prompt
     uid               : report UID, used for filename
-    generator         : "dalle" or "gemini" (overrides config)
-    image_paths       : optional reference image paths (Gemini only)
+    generator         : "dalle", "gemini", or "sd3" (overrides config)
+    image_paths       : optional reference image paths. Used by Gemini as
+                        multimodal input and by SD3 in img2img mode; ignored
+                        by DALL-E and by SD3 in txt2img mode.
     source_dimensions : optional (width, height) of the original image.
                         Passed to the backend to generate at the closest
                         native aspect ratio — no post-processing resize.
+    structured_prompt : optional StructuredRadiologyPrompt the text came from.
+                        SD3 only, where it produces a cleaner CLIP prompt.
+    sd3_mode          : "txt2img" or "img2img" (SD3 only, overrides config)
 
     Returns
     -------
@@ -290,5 +298,17 @@ def generate_image(
             view_suffix=view_suffix,
             source_dimensions=source_dimensions,
         )
+    elif gen == "sd3":
+        from .sd3_generator import generate_image_sd3
+
+        return generate_image_sd3(
+            prompt, uid, image_paths=image_paths,
+            view_suffix=view_suffix,
+            source_dimensions=source_dimensions,
+            structured_prompt=structured_prompt,
+            mode=sd3_mode,
+        )
     else:
-        raise ValueError(f"Unknown image generator: {gen}. Use 'dalle' or 'gemini'.")
+        raise ValueError(
+            f"Unknown image generator: {gen}. Use 'dalle', 'gemini', or 'sd3'."
+        )

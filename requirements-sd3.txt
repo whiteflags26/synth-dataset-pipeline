@@ -1,0 +1,20 @@
+# Stable Diffusion 3 back-end (--generator sd3).
+#
+# Kept separate from requirements.txt so a CPU-only clone, CI, or a run using
+# only the dalle/gemini back-ends does not pull a multi-gigabyte torch wheel.
+# On Kaggle and Colab, torch is preinstalled — install the rest and do NOT
+# reinstall torch, which frequently breaks the CUDA build.
+#
+#   pip install -r requirements-sd3.txt
+#
+# The model is a gated HuggingFace repo: accept the license at
+# huggingface.co/stabilityai/stable-diffusion-3-medium, then set
+# HUGGINGFACE_TOKEN in .env before the first run.
+
+torch>=2.1.0
+diffusers>=0.31.0
+transformers>=4.44.0
+accelerate>=0.33.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+safetensors>=0.4.0
