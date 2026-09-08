@@ -186,7 +186,15 @@ def load_sd3_pipeline(mode: str | None = None):
             pipe = pipe.to(device)
 
         if config.SD3_ENABLE_VAE_SLICING:
-            pipe.enable_vae_slicing()
+            # StableDiffusion3Pipeline doesn't expose enable_vae_slicing() as a
+            # pipeline-level convenience method on every diffusers release —
+            # go straight to the VAE itself, which supports it universally.
+            if hasattr(pipe, "enable_vae_slicing"):
+                pipe.enable_vae_slicing()
+            elif hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+                pipe.vae.enable_slicing()
+            else:
+                print("   ⚠ VAE slicing not available on this pipeline/diffusers version — skipping")
 
         print(f"   → SD3 ready in {time.time() - started:.1f}s")
         _PIPELINE_CACHE["txt2img"] = pipe
