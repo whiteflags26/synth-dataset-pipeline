@@ -339,6 +339,134 @@ with tempfile.TemporaryDirectory() as tmp:
 config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image = _saved
 
 
+# ─── 9. _load_completed_uids ─────────────────────────────────────────────────
+
+print("\n[9] _load_completed_uids")
+
+from pipeline.pipeline import _load_completed_uids
+
+with tempfile.TemporaryDirectory() as tmp:
+    missing_path = Path(tmp) / "does_not_exist.json"
+    by_uid, completed = _load_completed_uids(missing_path)
+    check("missing file yields no completed uids", completed == set())
+    check("missing file yields an empty by_uid map", by_uid == {})
+
+    meta_path = Path(tmp) / "meta.json"
+    meta_path.write_text(
+        json.dumps(
+            [
+                # Fully successful, single view — done.
+                {"uid": 1, "views": [{"view": None, "image_path": "1.png"}]},
+                # Fully successful, multi-view — done.
+                {
+                    "uid": 2,
+                    "views": [
+                        {"view": "PA", "image_path": "2_PA.png"},
+                        {"view": "Lateral", "image_path": "2_Lateral.png"},
+                    ],
+                },
+                # Prompt extraction failed — retry.
+                {"uid": 3, "error_prompt": "LLM timeout"},
+                # One view succeeded, one failed — retry (no partial patching).
+                {
+                    "uid": 4,
+                    "views": [
+                        {"view": "PA", "image_path": "4_PA.png"},
+                        {"view": "Lateral", "error_image": "OOM"},
+                    ],
+                },
+                # No views at all (e.g. skip-images run) — retry.
+                {"uid": 5, "views": []},
+            ]
+        )
+    )
+
+    by_uid, completed = _load_completed_uids(meta_path)
+    check("finds every entry regardless of completion", set(by_uid) == {1, 2, 3, 4, 5})
+    check("single-view success counts as complete", 1 in completed)
+    check("multi-view success counts as complete", 2 in completed)
+    check("error_prompt entry is not complete", 3 not in completed)
+    check("partially failed multi-view entry is not complete", 4 not in completed)
+    check("empty-views entry is not complete", 5 not in completed)
+    check("exactly the two done uids are returned", completed == {1, 2})
+
+
+# ─── 10. run_from_prompts resume behaviour ───────────────────────────────────
+
+print("\n[10] run_from_prompts(resume=True)")
+
+_saved10 = (config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image)
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp_path = Path(tmp)
+    (tmp_path / "prompts.json").write_text(
+        json.dumps(
+            [
+                {"uid": 1, "views": [{"view": None, "image_prompt": "prompt one"}]},
+                {"uid": 2, "views": [{"view": None, "image_prompt": "prompt two"}]},
+                {"uid": 3, "views": [{"view": None, "image_prompt": "prompt three"}]},
+            ]
+        )
+    )
+
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.IMAGES_DIR = config.OUTPUT_DIR / "images"
+    config.METADATA_FILE = config.OUTPUT_DIR / "metadata.json"
+    config.IMAGES_DIR.mkdir(parents=True)
+
+    # Simulate a prior run that crashed after uid=1 succeeded and uid=2 failed.
+    config.METADATA_FILE.write_text(
+        json.dumps(
+            [
+                {"uid": 1, "views": [{"view": None, "image_path": "1.png"}]},
+                {"uid": 2, "views": [{"view": None, "error_image": "OOM"}]},
+            ]
+        )
+    )
+
+    generate_calls: list[int] = []
+
+    def _fake_generate(prompt, uid, **kwargs):
+        generate_calls.append(uid)
+        out = config.IMAGES_DIR / f"{uid}.png"
+        PILImage.new("L", (8, 8)).save(out)
+        return out
+
+    _saved_fn = pl.generate_image
+    pl.generate_image = _fake_generate
+    try:
+        results = pl.run_from_prompts(
+            tmp_path / "prompts.json", generator="dalle", resume=True
+        )
+    finally:
+        pl.generate_image = _saved_fn
+
+    check(
+        "already-complete uid=1 is not regenerated",
+        1 not in generate_calls,
+        f"generate_calls={generate_calls}",
+    )
+    check(
+        "previously-failed uid=2 is retried",
+        2 in generate_calls,
+        f"generate_calls={generate_calls}",
+    )
+    check("new uid=3 is generated", 3 in generate_calls)
+    check("final results include all three uids", {r["uid"] for r in results} == {1, 2, 3})
+
+    written = json.loads(config.METADATA_FILE.read_text())
+    check(
+        "uid=1's carried-over entry is unchanged",
+        next(e for e in written if e["uid"] == 1)["views"][0]["image_path"] == "1.png",
+    )
+    check(
+        "uid=2 now has an image_path instead of an error",
+        "image_path" in next(e for e in written if e["uid"] == 2)["views"][0],
+    )
+
+config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image = _saved10
+
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 print()

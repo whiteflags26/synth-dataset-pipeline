@@ -40,6 +40,54 @@ def _apply_output_subdir(name: str) -> None:
     config.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _load_completed_uids(metadata_path: Path) -> tuple[dict[int, dict], set[int]]:
+    """
+    Read an existing metadata file and determine which uids are fully done.
+
+    A uid counts as done when prompt extraction succeeded and every view was
+    successfully generated (no error_prompt, no error_image, every view has an
+    image_path). Anything else — a failed extraction, a partially generated
+    multi-view report — is retried on resume rather than patched in place;
+    redoing a failed record is cheap next to the complexity of splicing in
+    just the missing view.
+
+    Returns
+    -------
+    (by_uid, completed_uids)
+        by_uid         : every existing entry, keyed by uid, so completed ones
+                         can be carried forward into a resumed run's results.
+        completed_uids : the subset that should be skipped on resume.
+    """
+    if not Path(metadata_path).exists():
+        return {}, set()
+
+    with open(metadata_path, encoding="utf-8") as f:
+        existing = json.load(f)
+
+    by_uid = {e["uid"]: e for e in existing}
+    completed = {
+        uid
+        for uid, entry in by_uid.items()
+        if not entry.get("error_prompt")
+        and entry.get("views")
+        and all("image_path" in v for v in entry["views"])
+    }
+    return by_uid, completed
+
+
+def _save_metadata(results: list[dict]) -> None:
+    """
+    Write results to config.METADATA_FILE.
+
+    Called after every record, not just once at the end, so a killed session
+    (Kaggle's 12h cap, an OOM, a manual stop) loses at most the record that
+    was in flight. --resume reads this same file back on the next invocation.
+    """
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(config.METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+
 def _sd3_params(
     sd3_mode: str | None,
     ref_image_paths: list[Path] | None,
@@ -87,6 +135,7 @@ def run_pipeline(
     images_dir: str | Path | None = None,
     sd3_mode: str | None = None,
     output_subdir: str | None = None,
+    resume: bool = False,
 ) -> list[dict]:
     """
     Execute the full pipeline.
@@ -109,10 +158,18 @@ def run_pipeline(
     output_subdir         : write images to output/images/<name>/ and metadata
                             to output/metadata_<name>.json instead of the
                             defaults, so parallel runs do not overwrite.
+    resume                : skip uids that already have a complete, error-free
+                            entry in the target metadata file (see
+                            output_subdir), and continue appending into it.
+                            Failed or partial entries are retried. Combined
+                            with the fact that metadata is saved after every
+                            record, an interrupted run only needs the same
+                            command re-run with --resume to pick back up.
 
     Returns
     -------
-    list of metadata dicts for each processed report
+    list of metadata dicts for each processed report — the full accumulated
+    set when resume=True, including entries carried over unchanged.
     """
     gen = generator or config.IMAGE_GENERATOR
     images_dir_path = Path(images_dir) if images_dir else None
@@ -143,6 +200,22 @@ def run_pipeline(
     records = load_reports(csv_path, limit=limit, offset=offset, projections=projections)
     print(f"   → {len(records)} reports loaded\n")
 
+    # ── Resume: skip uids already done in the target metadata file ────────
+    results: list[dict] = []
+    if resume:
+        by_uid, completed_uids = _load_completed_uids(config.METADATA_FILE)
+        if completed_uids:
+            before = len(records)
+            records = [r for r in records if r.uid not in completed_uids]
+            print(
+                f"↻  Resume: {len(completed_uids)} uid(s) already complete in "
+                f"{config.METADATA_FILE.name}, skipping. "
+                f"{len(records)} of {before} remaining.\n"
+            )
+            results = [by_uid[uid] for uid in by_uid if uid in completed_uids]
+        elif Path(config.METADATA_FILE).exists():
+            print(f"↻  Resume: {config.METADATA_FILE.name} exists but has no complete entries to skip.\n")
+
     # ── Build the LangChain chain once (reused across all records) ────────
     print(f"🤖 Initializing LLM chain (model: {config.CHAT_MODEL}) ...")
     chain = build_prompt_chain()
@@ -161,8 +234,6 @@ def run_pipeline(
             load_sd3_pipeline("img2img")
         print()
 
-    results: list[dict] = []
-
     for record in tqdm(records, desc="Processing reports", unit="report"):
         entry: dict = {"uid": record.uid}
 
@@ -178,6 +249,7 @@ def run_pipeline(
             print(f"\n  ✗ Failed to extract prompt for uid={record.uid}: {e}")
             entry["error_prompt"] = str(e)
             results.append(entry)
+            _save_metadata(results)
             continue
 
         # ── Step 1.5: Split by views ─────────────────────────────────────
@@ -285,11 +357,8 @@ def run_pipeline(
         entry["generator"] = gen
         entry["views"] = views_data
         results.append(entry)
+        _save_metadata(results)
 
-    # ── Save metadata ────────────────────────────────────────────────────
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(config.METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n📄 Metadata saved to {config.METADATA_FILE}")
     print(f"🖼  Images saved to {config.IMAGES_DIR}")
 
@@ -307,6 +376,7 @@ def run_from_prompts(
     images_dir: str | Path | None = None,
     sd3_mode: str | None = None,
     output_subdir: str | None = None,
+    resume: bool = False,
 ) -> list[dict]:
     """
     Generate images from prompts already extracted into a metadata JSON file.
@@ -322,6 +392,8 @@ def run_from_prompts(
     images_dir    : needed only for SD3 img2img / Gemini reference images;
                     filenames come from the metadata's reference_images
     output_subdir : write elsewhere so the source file is not overwritten
+    resume        : skip uids that already have a complete, error-free entry
+                    in the target metadata file; see run_pipeline's resume.
 
     Returns
     -------
@@ -351,6 +423,22 @@ def run_from_prompts(
         entries = entries[:limit]
     print(f"   → {len(entries)} report(s) with prompts\n")
 
+    # ── Resume: skip uids already done in the target metadata file ────────
+    results: list[dict] = []
+    if resume:
+        by_uid, completed_uids = _load_completed_uids(config.METADATA_FILE)
+        if completed_uids:
+            before = len(entries)
+            entries = [e for e in entries if e["uid"] not in completed_uids]
+            print(
+                f"↻  Resume: {len(completed_uids)} uid(s) already complete in "
+                f"{config.METADATA_FILE.name}, skipping. "
+                f"{len(entries)} of {before} remaining.\n"
+            )
+            results = [by_uid[uid] for uid in by_uid if uid in completed_uids]
+        elif Path(config.METADATA_FILE).exists():
+            print(f"↻  Resume: {config.METADATA_FILE.name} exists but has no complete entries to skip.\n")
+
     effective_sd3_mode = (sd3_mode or config.SD3_MODE).lower() if gen == "sd3" else None
     if effective_sd3_mode == "img2img" and not images_dir_path:
         print(
@@ -365,8 +453,6 @@ def run_from_prompts(
         if effective_sd3_mode == "img2img":
             load_sd3_pipeline("img2img")
         print()
-
-    results: list[dict] = []
 
     for source in tqdm(entries, desc="Generating images", unit="report"):
         uid = source["uid"]
@@ -429,10 +515,8 @@ def run_from_prompts(
 
         entry["views"] = views_data
         results.append(entry)
+        _save_metadata(results)
 
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(config.METADATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"\n📄 Metadata saved to {config.METADATA_FILE}")
     print(f"🖼  Images saved to {config.IMAGES_DIR}")
 
@@ -557,6 +641,18 @@ def main():
             "Mutually exclusive with --csv."
         ),
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Skip uids that already have a complete, error-free entry in the "
+            "target metadata file (see --output-subdir), and continue "
+            "appending into it. Failed or partial entries are retried. "
+            "Metadata is saved after every record regardless of this flag, so "
+            "an interrupted run only needs the same command re-run with "
+            "--resume to pick back up."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -588,6 +684,7 @@ def main():
             images_dir=args.images_dir,
             sd3_mode=args.sd3_mode,
             output_subdir=args.output_subdir,
+            resume=args.resume,
         )
         return
 
@@ -601,6 +698,7 @@ def main():
         images_dir=args.images_dir,
         sd3_mode=args.sd3_mode,
         output_subdir=args.output_subdir,
+        resume=args.resume,
     )
 
 
