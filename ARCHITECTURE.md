@@ -121,9 +121,11 @@ All configuration lives in **`pipeline/config.py`**, which loads a `.env` from t
 - **Paths:** `PROJECT_ROOT`, `OUTPUT_DIR`, `IMAGES_DIR`, `METADATA_FILE`.
 - **`IS_KAGGLE`** is derived from `KAGGLE_KERNEL_RUN_TYPE`. On Kaggle both the chat and image clients switch to plain API-key auth, because Kaggle's `kaggle_gcp.py` causes a circular import with `google.cloud.aiplatform`. Any new Google-SDK code must honor this branch.
 
-CLI flags (`--generator`, `--limit`, `--offset`, `--csv`, `--projections-csv`, `--images-dir`, `--skip-images`, `--sd3-mode`, `--sd3-strength`, `--sd3-steps`, `--sd3-guidance`, `--sd3-seed`, `--sd3-model-id`, `--output-subdir`, `--prompts-from`) override config at call time; the pattern is `value = arg or config.DEFAULT`. The SD3 scalar flags are applied by mutating `config.*` in `main()` before `run_pipeline` is called.
+CLI flags (`--generator`, `--limit`, `--offset`, `--csv`, `--projections-csv`, `--images-dir`, `--skip-images`, `--sd3-mode`, `--sd3-strength`, `--sd3-steps`, `--sd3-guidance`, `--sd3-seed`, `--sd3-model-id`, `--output-subdir`, `--prompts-from`, `--resume`, `--num-shards`, `--shard-index`) override config at call time; the pattern is `value = arg or config.DEFAULT`. The SD3 scalar flags are applied by mutating `config.*` in `main()` before `run_pipeline` is called.
 
 **`--output-subdir NAME`** redirects `config.IMAGES_DIR` to `output/images/<NAME>/` and `config.METADATA_FILE` to `output/metadata_<NAME>.json`. Because the filename contract is `<uid>.png` regardless of backend or settings, two runs over the same uids (txt2img vs img2img, or a parameter sweep) would otherwise overwrite each other.
+
+**`--num-shards N --shard-index I`** (both required together, `_apply_shard` in `pipeline.py`) restrict the loaded reports/entries to `uid % N == I`, for splitting one CSV across multiple GPU processes — e.g. Kaggle's "GPU T4 x2" accelerator, launched via `CUDA_VISIBLE_DEVICES=0`/`1` with a distinct `--output-subdir` per shard. Assignment is by `uid % N`, not a list slice, so it's stable regardless of load order and each shard's `--resume` only ever sees its own uids. `merge_shards.py <name1> <name2> ...` combines the shards' `metadata_<name>.json` files and image directories back into one `metadata.json`/`images/` (or another `--output-subdir` target), sorted by uid. No changes were needed in `sd3_generator.py` for this — `_select_device` already resolves to whichever GPU the process's `CUDA_VISIBLE_DEVICES` makes visible.
 
 ## 7. How to Add a New Module
 

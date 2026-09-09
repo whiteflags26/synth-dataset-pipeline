@@ -467,6 +467,105 @@ with tempfile.TemporaryDirectory() as tmp:
 config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image = _saved10
 
 
+# ─── 11. _apply_shard ────────────────────────────────────────────────────────
+
+print("\n[11] _apply_shard")
+
+from pipeline.pipeline import _apply_shard
+
+uids = list(range(10))  # 0..9
+
+check("no sharding returns None", _apply_shard(uids, None, None) is None)
+
+shard0 = _apply_shard(uids, 2, 0)
+shard1 = _apply_shard(uids, 2, 1)
+check("2-way shards are disjoint", shard0.isdisjoint(shard1))
+check("2-way shards cover every uid", shard0 | shard1 == set(uids))
+check("shard 0 gets the even uids", shard0 == {0, 2, 4, 6, 8})
+
+three = [_apply_shard(uids, 3, i) for i in range(3)]
+check(
+    "3-way shards are pairwise disjoint and cover everything",
+    three[0] | three[1] | three[2] == set(uids)
+    and three[0].isdisjoint(three[1])
+    and three[1].isdisjoint(three[2]),
+)
+
+try:
+    _apply_shard(uids, 2, None)
+    check("shard-index required with num-shards raises", False, "no exception raised")
+except ValueError:
+    check("shard-index required with num-shards raises", True)
+
+try:
+    _apply_shard(uids, 2, 2)
+    check("out-of-range shard-index raises", False, "no exception raised")
+except ValueError:
+    check("out-of-range shard-index raises", True)
+
+
+# ─── 12. run_from_prompts with sharding + merge_shards ───────────────────────
+
+print("\n[12] sharded run_from_prompts + merge_shards")
+
+import merge_shards
+
+_saved12 = (config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image)
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp_path = Path(tmp)
+    (tmp_path / "prompts.json").write_text(
+        json.dumps(
+            [
+                {"uid": uid, "views": [{"view": None, "image_prompt": f"prompt {uid}"}]}
+                for uid in range(6)
+            ]
+        )
+    )
+
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.IMAGES_DIR = config.OUTPUT_DIR / "images"
+    config.METADATA_FILE = config.OUTPUT_DIR / "metadata.json"
+
+    def _fake_generate(prompt, uid, **kwargs):
+        out = config.IMAGES_DIR / f"{uid}.png"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        PILImage.new("L", (8, 8)).save(out)
+        return out
+
+    pl.generate_image = _fake_generate
+    try:
+        # Two "GPU processes" simulated in-process, one per shard, each with
+        # its own --output-subdir exactly as the Kaggle parallel-run cell does.
+        for shard_index, name in enumerate(("gpu0", "gpu1")):
+            pl.run_from_prompts(
+                tmp_path / "prompts.json",
+                generator="dalle",
+                output_subdir=name,
+                num_shards=2,
+                shard_index=shard_index,
+            )
+    finally:
+        pl.generate_image = _saved12[3]
+
+    meta_gpu0 = json.loads((config.OUTPUT_DIR / "metadata_gpu0.json").read_text())
+    meta_gpu1 = json.loads((config.OUTPUT_DIR / "metadata_gpu1.json").read_text())
+    check("shard gpu0 gets its half", {e["uid"] for e in meta_gpu0} == {0, 2, 4})
+    check("shard gpu1 gets its half", {e["uid"] for e in meta_gpu1} == {1, 3, 5})
+
+    merged_path = merge_shards.merge_shards(["gpu0", "gpu1"])
+    merged = json.loads(merged_path.read_text())
+    check("merged metadata has all 6 uids", {e["uid"] for e in merged} == set(range(6)))
+    check("merged metadata is sorted by uid", [e["uid"] for e in merged] == sorted(e["uid"] for e in merged))
+    merged_images_dir = config.OUTPUT_DIR / "images"
+    check(
+        "merged images dir has all 6 files",
+        {p.name for p in merged_images_dir.glob("*.png")} == {f"{uid}.png" for uid in range(6)},
+    )
+
+config.OUTPUT_DIR, config.IMAGES_DIR, config.METADATA_FILE, pl.generate_image = _saved12
+
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 print()

@@ -484,6 +484,38 @@ the loader detects this and falls back to `float16` with a warning.
 `SD3_DROP_T5=true` frees ~10 GB as a last resort, but leaves only the 77-token
 CLIP encoders and so discards the long clinical prompt.
 
+### Multi-GPU parallel runs
+
+On a session with more than one GPU (e.g. Kaggle's "GPU T4 x2"), `--num-shards`
+and `--shard-index` split the work by `uid % num_shards` so one process per GPU
+can run at once — roughly halving wall time versus one GPU alone. No SD3 code
+change is needed: pin each process to its GPU with `CUDA_VISIBLE_DEVICES`, and
+device selection resolves to whatever that process can see.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pipeline --generator sd3 --sd3-mode txt2img \
+  --csv indiana_reports.csv --num-shards 2 --shard-index 0 \
+  --output-subdir txt2img_gpu0 --resume &
+
+CUDA_VISIBLE_DEVICES=1 python -m pipeline --generator sd3 --sd3-mode txt2img \
+  --csv indiana_reports.csv --num-shards 2 --shard-index 1 \
+  --output-subdir txt2img_gpu1 --resume &
+
+wait
+python merge_shards.py txt2img_gpu0 txt2img_gpu1 --output-subdir txt2img
+```
+
+`merge_shards.py` combines each shard's `metadata_<name>.json` and
+`images/<name>/` into one `metadata_<name>.json`/`images/<name>/` (or the
+default `output/metadata.json`/`images/` if `--output-subdir` is omitted),
+sorted by uid. Each shard's `--resume` only ever sees its own uids, so
+re-running a shard after an interruption is safe. The Kaggle notebook's cell
+12c does exactly this via `subprocess.Popen` instead of shell backgrounding.
+
+Running two GPUs in parallel means two independent CPU-offloaded model
+copies, so expect roughly double the system RAM use versus one shard; if that
+overflows, set `SD3_DROP_T5=true` or fall back to a single shard.
+
 ### Prompt handling
 
 SD3 encodes text with three encoders: CLIP-L and CLIP-G both truncate at **77

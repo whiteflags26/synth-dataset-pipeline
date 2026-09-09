@@ -40,6 +40,28 @@ def _apply_output_subdir(name: str) -> None:
     config.IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _apply_shard(
+    uids: list[int],
+    num_shards: int | None,
+    shard_index: int | None,
+) -> set[int] | None:
+    """
+    Validate a shard request and return the set of uids assigned to it.
+
+    Assignment is uid % num_shards == shard_index rather than a slice of the
+    list, so it stays stable if the CSV is re-ordered or filtered elsewhere,
+    and two shards run from the same --csv never need to agree on ordering.
+    Returns None when no sharding was requested (num_shards is None).
+    """
+    if num_shards is None:
+        return None
+    if shard_index is None:
+        raise ValueError("--shard-index is required when --num-shards is given")
+    if num_shards < 1 or not (0 <= shard_index < num_shards):
+        raise ValueError(f"--shard-index must be in [0, {num_shards})")
+    return {uid for uid in uids if uid % num_shards == shard_index}
+
+
 def _load_completed_uids(metadata_path: Path) -> tuple[dict[int, dict], set[int]]:
     """
     Read an existing metadata file and determine which uids are fully done.
@@ -136,6 +158,8 @@ def run_pipeline(
     sd3_mode: str | None = None,
     output_subdir: str | None = None,
     resume: bool = False,
+    num_shards: int | None = None,
+    shard_index: int | None = None,
 ) -> list[dict]:
     """
     Execute the full pipeline.
@@ -165,6 +189,13 @@ def run_pipeline(
                             with the fact that metadata is saved after every
                             record, an interrupted run only needs the same
                             command re-run with --resume to pick back up.
+    num_shards, shard_index : split the loaded reports across N processes by
+                            uid % num_shards == shard_index, so two (or more)
+                            processes — typically one per GPU on a multi-GPU
+                            Kaggle session — can each own a disjoint slice of
+                            the work. Pair with a distinct --output-subdir per
+                            shard so their metadata/images never collide, then
+                            merge_shards.py combines the results afterward.
 
     Returns
     -------
@@ -199,6 +230,16 @@ def run_pipeline(
     print(f"📂 Loading reports from {csv_path} ...")
     records = load_reports(csv_path, limit=limit, offset=offset, projections=projections)
     print(f"   → {len(records)} reports loaded\n")
+
+    # ── Shard: keep only the uids this process owns ───────────────────────
+    shard_uids = _apply_shard([r.uid for r in records], num_shards, shard_index)
+    if shard_uids is not None:
+        before = len(records)
+        records = [r for r in records if r.uid in shard_uids]
+        print(
+            f"🔀 Shard {shard_index}/{num_shards}: {len(records)} of {before} "
+            f"report(s) assigned to this shard (uid % {num_shards} == {shard_index}).\n"
+        )
 
     # ── Resume: skip uids already done in the target metadata file ────────
     results: list[dict] = []
@@ -377,6 +418,8 @@ def run_from_prompts(
     sd3_mode: str | None = None,
     output_subdir: str | None = None,
     resume: bool = False,
+    num_shards: int | None = None,
+    shard_index: int | None = None,
 ) -> list[dict]:
     """
     Generate images from prompts already extracted into a metadata JSON file.
@@ -394,6 +437,8 @@ def run_from_prompts(
     output_subdir : write elsewhere so the source file is not overwritten
     resume        : skip uids that already have a complete, error-free entry
                     in the target metadata file; see run_pipeline's resume.
+    num_shards, shard_index : split entries by uid % num_shards == shard_index
+                    for multi-GPU parallel runs; see run_pipeline.
 
     Returns
     -------
@@ -417,6 +462,17 @@ def run_from_prompts(
         source_entries = json.load(f)
 
     entries = [e for e in source_entries if e.get("views")]
+
+    # ── Shard: keep only the uids this process owns ───────────────────────
+    shard_uids = _apply_shard([e["uid"] for e in entries], num_shards, shard_index)
+    if shard_uids is not None:
+        before = len(entries)
+        entries = [e for e in entries if e["uid"] in shard_uids]
+        print(
+            f"🔀 Shard {shard_index}/{num_shards}: {len(entries)} of {before} "
+            f"report(s) assigned to this shard (uid % {num_shards} == {shard_index}).\n"
+        )
+
     if offset:
         entries = entries[offset:]
     if limit:
@@ -653,8 +709,38 @@ def main():
             "--resume to pick back up."
         ),
     )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=None,
+        help=(
+            "Split the work into N shards for parallel multi-GPU runs (e.g. "
+            "Kaggle's GPU T4 x2). Requires --shard-index. Run one process per "
+            "GPU with CUDA_VISIBLE_DEVICES set and a distinct --output-subdir "
+            "per shard, then combine with merge_shards.py."
+        ),
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help=(
+            "Which shard this process handles, 0-indexed. Requires "
+            "--num-shards. Assignment is uid %% num_shards == shard_index, "
+            "so it is stable regardless of CSV ordering."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if (args.num_shards is None) != (args.shard_index is None):
+        parser.error("--num-shards and --shard-index must be given together.")
+    if args.num_shards and not args.output_subdir:
+        print(
+            "⚠  Sharding without --output-subdir: every shard will write to the "
+            "same metadata.json and image directory. Give each shard its own "
+            "--output-subdir, then merge with merge_shards.py.\n"
+        )
 
     # CLI overrides config, following the value = arg or config.DEFAULT pattern.
     if args.sd3_steps is not None:
@@ -685,6 +771,8 @@ def main():
             sd3_mode=args.sd3_mode,
             output_subdir=args.output_subdir,
             resume=args.resume,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
         )
         return
 
@@ -699,6 +787,8 @@ def main():
         sd3_mode=args.sd3_mode,
         output_subdir=args.output_subdir,
         resume=args.resume,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
     )
 
 
